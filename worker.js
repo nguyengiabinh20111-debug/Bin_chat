@@ -5,15 +5,17 @@ const CORS_HEADERS = {
   "Content-Type": "application/json; charset=utf-8"
 };
 
-// Lưu tạm trong RAM của instance Worker (tự reset khi Worker ngủ/khởi động lại)
-const memoryStore = {
+const ONLINE_TTL_SEC = 120;
+const MAX_MESSAGES = 200;
+const KEY_MESSAGES = "shared:messages:v1";
+const KEY_NEXT_ID = "shared:next_id:v1";
+const KEY_USERS = "shared:users:v1";
+
+const fallbackStore = {
   messages: [],
   nextId: 1,
-  users: new Map() // username -> { user, displayName, userId, server, lastSeen }
+  users: {}
 };
-
-const ONLINE_TTL_MS = 120 * 1000; // Coi là online nếu ping trong 120 giây gần nhất
-const MAX_MESSAGES = 200;
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -22,27 +24,74 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function pruneUsers() {
-  const now = Date.now();
-  for (const [key, info] of memoryStore.users.entries()) {
-    if (!info || (now - (info.lastSeen || 0)) > ONLINE_TTL_MS) {
-      memoryStore.users.delete(key);
-    }
+async function readJson(kv, key, defaultVal) {
+  if (kv && typeof kv.get === "function") {
+    try {
+      const val = await kv.get(key, { type: "json" });
+      if (val !== null && val !== undefined) return val;
+    } catch (_) {}
   }
+  return defaultVal;
 }
 
-function getActiveUsersArray() {
-  pruneUsers();
-  const list = [];
-  for (const info of memoryStore.users.values()) {
-    list.push({
-      user: info.user,
-      displayName: info.displayName,
-      userId: info.userId,
-      server: info.server
-    });
+async function writeJson(kv, key, val) {
+  if (kv && typeof kv.put === "function") {
+    try {
+      await kv.put(key, JSON.stringify(val));
+      return true;
+    } catch (_) {}
   }
-  return list;
+  return false;
+}
+
+function pruneUsersMap(usersObj) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const clean = {};
+  const list = [];
+
+  for (const [username, info] of Object.entries(usersObj || {})) {
+    if (info && (nowSec - (Number(info.lastSeenSec) || 0)) <= ONLINE_TTL_SEC) {
+      clean[username] = info;
+      list.push({
+        user: info.user,
+        displayName: info.displayName,
+        userId: info.userId,
+        server: info.server
+      });
+    }
+  }
+  return { clean, list };
+}
+
+async function getAllState(env) {
+  const kv = env && env.bin_chat;
+  const messages = await readJson(kv, KEY_MESSAGES, fallbackStore.messages);
+  const nextIdRaw = await readJson(kv, KEY_NEXT_ID, fallbackStore.nextId);
+  const usersRaw = await readJson(kv, KEY_USERS, fallbackStore.users);
+
+  return {
+    kv,
+    messages: Array.isArray(messages) ? messages : [],
+    nextId: Math.max(1, Number(nextIdRaw) || 1),
+    users: (usersRaw && typeof usersRaw === "object") ? usersRaw : {}
+  };
+}
+
+async function saveAllState(state, saveMessages, saveUsers) {
+  fallbackStore.messages = state.messages;
+  fallbackStore.nextId = state.nextId;
+  fallbackStore.users = state.users;
+
+  if (!state.kv) return;
+  const tasks = [];
+  if (saveMessages) {
+    tasks.push(writeJson(state.kv, KEY_MESSAGES, state.messages));
+    tasks.push(writeJson(state.kv, KEY_NEXT_ID, state.nextId));
+  }
+  if (saveUsers) {
+    tasks.push(writeJson(state.kv, KEY_USERS, state.users));
+  }
+  await Promise.all(tasks);
 }
 
 export default {
@@ -54,18 +103,18 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
-    // 1. Lấy danh sách tin nhắn: GET /messages?after=0
     if (request.method === "GET" && path === "/messages") {
       const after = Number(url.searchParams.get("after") || "0") || 0;
-      const filtered = memoryStore.messages.filter((m) => m.id > after);
+      const state = await getAllState(env);
+      const filtered = state.messages.filter((m) => Number(m.id) > after);
       return jsonResponse({
         ok: true,
         messages: filtered,
-        latestId: memoryStore.nextId - 1
+        latestId: state.nextId - 1,
+        kvEnabled: Boolean(state.kv)
       });
     }
 
-    // 2. Gửi tin nhắn: POST /send
     if (request.method === "POST" && path === "/send") {
       let body = {};
       try {
@@ -85,18 +134,22 @@ export default {
         return jsonResponse({ ok: false, error: "Empty text" }, 400);
       }
 
+      const state = await getAllState(env);
+      let usersChanged = false;
+
       if (user && user !== "Player" && user !== "Hệ thống") {
-        memoryStore.users.set(user, {
+        state.users[user] = {
           user,
           displayName,
           userId,
           server,
-          lastSeen: Date.now()
-        });
+          lastSeenSec: Math.floor(Date.now() / 1000)
+        };
+        usersChanged = true;
       }
 
       const msg = {
-        id: memoryStore.nextId++,
+        id: state.nextId++,
         user,
         displayName,
         userId,
@@ -105,15 +158,15 @@ export default {
         time
       };
 
-      memoryStore.messages.push(msg);
-      if (memoryStore.messages.length > MAX_MESSAGES) {
-        memoryStore.messages.splice(0, memoryStore.messages.length - MAX_MESSAGES);
+      state.messages.push(msg);
+      if (state.messages.length > MAX_MESSAGES) {
+        state.messages.splice(0, state.messages.length - MAX_MESSAGES);
       }
 
+      await saveAllState(state, true, usersChanged);
       return jsonResponse({ ok: true, message: msg });
     }
 
-    // 3. Điểm danh online: POST /ping
     if (request.method === "POST" && path === "/ping") {
       let body = {};
       try {
@@ -127,38 +180,46 @@ export default {
       const userId = Number(body.userId || 0) || 0;
       const server = String(body.server || "Global").slice(0, 32);
 
+      const state = await getAllState(env);
       if (user && user !== "Player" && user !== "Hệ thống") {
-        memoryStore.users.set(user, {
+        state.users[user] = {
           user,
           displayName,
           userId,
           server,
-          lastSeen: Date.now()
-        });
+          lastSeenSec: Math.floor(Date.now() / 1000)
+        };
       }
 
-      const users = getActiveUsersArray();
+      const pruned = pruneUsersMap(state.users);
+      state.users = pruned.clean;
+      await saveAllState(state, false, true);
+
       return jsonResponse({
         ok: true,
-        online: Math.max(1, users.length),
-        users
+        online: Math.max(1, pruned.list.length),
+        users: pruned.list
       });
     }
 
-    // 4. Xem danh sách online khi bấm nút Online: GET /online
     if (request.method === "GET" && path === "/online") {
-      const users = getActiveUsersArray();
+      const state = await getAllState(env);
+      const pruned = pruneUsersMap(state.users);
+      state.users = pruned.clean;
+      await saveAllState(state, false, true);
+
       return jsonResponse({
         ok: true,
-        online: Math.max(1, users.length),
-        users
+        online: Math.max(1, pruned.list.length),
+        users: pruned.list
       });
     }
 
     return jsonResponse({
       ok: true,
-      service: "Hirose x Miyano Chat Worker",
-      endpoints: ["/messages", "/send", "/ping", "/online"]
+      service: "Hirose x Miyano Shared KV Worker",
+      kvEnabled: Boolean(env && env.bin_chat)
     });
   }
 };
+        
