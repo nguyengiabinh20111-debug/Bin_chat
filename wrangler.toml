@@ -1,8 +1,7 @@
-{
-  "kv_namespaces": [
-    {
-      "binding": "bin_chat",
-      "id": "3f50c1e3e702475abb6f7eb71cf1d4a4"
-    }
-  ]
-}
+name = "kion"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "bin_chat"
+id = "3f50c1e3e702475abb6f7eb71cf1d4a4"
