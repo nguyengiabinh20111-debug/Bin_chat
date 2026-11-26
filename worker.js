@@ -218,7 +218,7 @@ export default {
     return jsonResponse({
       ok: true,
       service: "Hirose x Miyano Shared KV Worker",
-      kvEnabled: Boolean(env && env.bin_chat)
+      kvEnabled: Boolean(env && env.CHAT_KV)
     });
   }
 };
