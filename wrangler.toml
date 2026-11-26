@@ -3,5 +3,5 @@ main = "worker.js"
 compatibility_date = "2026-01-01"
 
 [[kv_namespaces]]
-binding = "bin_chat"
+binding = "CHAT_KV"
 id = "3f50c1e3e702475abb6f7eb71cf1d4a4"
